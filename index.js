@@ -448,8 +448,8 @@
             };
 
             this.then = function(succ, err) {
-                sucCB = succ;
-                errCB = err;
+                sucCB = succ || sucCB;
+                errCB = err || errCB;
             };
         }
 
