@@ -26,6 +26,14 @@
     var dbName, _privateStore = {},
         _errorTables = [],
         _dbApi, type;
+
+    /**
+     * 
+     * @param {*} data 
+     */
+    function deepClone(data) {
+        return JSON.parse(JSON.stringify(data));
+    }
     /**
      * 
      * @param {*} config 
@@ -34,6 +42,21 @@
     function dbInit(config, CB) {
         dbName = config.name;
         _dbApi = useDB(createDB(config));
+
+        /**
+         * 
+         * @param {*} $dbName 
+         * @param {*} options 
+         */
+        function createDB(options) {
+            if (window.sqlitePlugin) {
+                return window.sqlitePlugin.openDatabase(options);
+            } else if (window.openDatabase) {
+                return window.openDatabase(options.name, options.version, options.name + ' Storage for webSql', 50 * 1024 * 1024)
+            }
+
+            return null;
+        }
 
         function loadAllData() {
             _dbApi.query('SELECT * FROM _JELI_STORE_', [])
@@ -76,7 +99,7 @@
                      * chunk query
                      */
                     if (TOTAL_RECORDS > MAXIMUM_RESULT) {
-                        console.log('preparing chunking of query result');
+                        console.log('[JDB SQL_ADAPTER]: preparing chunking of table ' + current);
                         for (var i = 0; i <= TOTAL_RECORDS; i += MAXIMUM_RESULT) {
                             chunkQueries.push([i, MAXIMUM_RESULT])
                         }
@@ -142,7 +165,7 @@
                  * @param {*} err 
                  */
                 function error(err) {
-                    console.log('failed to load:', current);
+                    console.log('[JDB SQL_ADAPTER]: failed to load:', current);
                     _errorTables.push(current);
                     nextQuery();
                 }
@@ -172,19 +195,41 @@
                     .then(function() {}, txError);
             })
             .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onAlterTable'), function(tableName, columnName, action) {
+                var columnData = "";
                 _dbApi.alterTable.apply(_dbApi, arguments)
                     .then(function() {
                         if (action) {
                             var tblData = _privateStore[tableName + ":data"];
                             if (tblData.length) {
                                 var columnData = tblData[0]._data[columnName];
-                                if (columnData) {
-                                    // update the table with the columnData
-                                    _dbApi.query('update ' + tableName + ' set ' + columnName + '=?', [columnData]);
-                                }
                             }
                         }
-                    });
+
+                        updateTable(columnData);
+                    }, handleAlterError);
+                /**
+                 * update a table when these actions are performed DROP | RENAME | ADD
+                 */
+                function updateTable() {
+                    _dbApi.query('update ' + tableName + ' set ' + columnName + '=?', [columnData])
+                }
+
+                /**
+                 * Below method helps to tackle issues with Sqlite lower version without support for 
+                 * RENAME and DROP COLUMN
+                 */
+                function handleAlterError() {
+                    // failure should be either for DROP and RENAME
+                    if (typeof columnName === 'object') {
+                        // rename mode
+                        _dbApi.alterTable(tableName, columnName[1], 1);
+                    } else {
+                        // drop
+                        if (!action) {
+                            updateTable();
+                        }
+                    }
+                }
             })
             .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onCreateTable'), createTable)
             .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onDropTable'), function(tbl) {
@@ -294,9 +339,6 @@
     }
 
     function publicApis() {
-        function deepClone(data) {
-            return JSON.parse(JSON.stringify(data));
-        }
         /**
          * 
          * @param {*} name 
@@ -350,21 +392,6 @@
     publicApis.prototype.isExists = function(key) {
         return _privateStore.hasOwnProperty(key);
     };
-
-    /**
-     * 
-     * @param {*} $dbName 
-     * @param {*} options 
-     */
-    function createDB(options) {
-        if (window.sqlitePlugin) {
-            return window.sqlitePlugin.openDatabase(options);
-        } else if (window.openDatabase) {
-            return window.openDatabase(options.name, '1.0', options.name + ' Storage for webSql', 50 * 1024 * 1024)
-        }
-
-        return null;
-    }
 
     function isArray(data) {
         return toString.call(data) === "[object Array]";
@@ -576,7 +603,14 @@
 
         _pub.alterTable = function(tbl, columnName, addRemoved) {
             var qPromise = new promiseHandler(),
-                executeQuery = "ALTER TABLE " + tbl + (addRemoved ? " ADD " : " DROP ") + columnName;
+                executeQuery = "ALTER TABLE " + tbl;
+
+            if (typeof columnName === "object") {
+                // RENAME process
+                executeQuery += 'RENAME COLUMN ' + columnName[0] + ' TO ' + columnName[1];
+            } else {
+                executeQuery += (addRemoved ? " ADD " : " DROP ") + columnName;
+            }
 
             sqlInstance.transaction(function(transaction) {
                 qPromise.setTotal(1);
@@ -623,7 +657,9 @@
 
 
     function txError(tx, txError) {
+        console.group('JDB SQL_ADAPTER');
         console.log(txError);
+        console.groupEnd();
     }
 
 

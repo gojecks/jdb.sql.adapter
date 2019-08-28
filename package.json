@@ -1,6 +1,6 @@
 {
     "name": "jdb.sql.adapter",
-    "version": "1.0.1-beta",
+    "version": "1.0.2-beta",
     "description": "sqlite adapters for jelidb",
     "main": "index.js",
     "files": [
