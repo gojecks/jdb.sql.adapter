@@ -23,9 +23,10 @@
      * {name: "mySQLite.db", location: 'default'}
      */
 
-    var dbName, _privateStore = {},
-        _errorTables = [],
-        _dbApi, type;
+    var dbName;
+    var _privateStore = {};
+    var _errorTables = [];
+    var _sqlFacade, type;
 
     /**
      * 
@@ -34,32 +35,47 @@
     function deepClone(data) {
         return JSON.parse(JSON.stringify(data));
     }
+
+    /**
+     * 
+     * @param {*} data 
+     */
+    function isArray(data) {
+        return toString.call(data) === "[object Array]";
+    }
+
+    /**
+     * 
+     * @param {*} $dbName 
+     * @param {*} options 
+     */
+    function createDB(options) {
+        /**
+         * check if name contains .db ext
+         */
+        options.name = options.name + ".db";
+        if (window.sqlitePlugin) {
+            return window.sqlitePlugin.openDatabase(options);
+        } else if (window.openDatabase) {
+            return window.openDatabase(options.name, options.version || 1, options.name + ' Storage for webSql', 50 * 1024 * 1024)
+        }
+
+        return null;
+    }
+
     /**
      * 
      * @param {*} config 
+     * @param {*} dbToStorageInstance 
      * @param {*} CB 
      */
-    function dbInit(config, CB) {
+    function dbInit(config, dbToStorageInstance, CB) {
         dbName = config.name;
-        _dbApi = useDB(createDB(config));
-
-        /**
-         * 
-         * @param {*} $dbName 
-         * @param {*} options 
-         */
-        function createDB(options) {
-            if (window.sqlitePlugin) {
-                return window.sqlitePlugin.openDatabase(options);
-            } else if (window.openDatabase) {
-                return window.openDatabase(options.name, options.version, options.name + ' Storage for webSql', 50 * 1024 * 1024)
-            }
-
-            return null;
-        }
+        _sqlFacade = new CoreSqlFacade(createDB(config));
+        var _storageFacade = new StorageFacade(dbToStorageInstance.generateStruct);
 
         function loadAllData() {
-            _dbApi.query('SELECT * FROM _JELI_STORE_', [])
+            _sqlFacade.query('SELECT * FROM _JELI_STORE_', [])
                 .then(function(tx, results) {
                     var len = results.rows.length,
                         i;
@@ -76,7 +92,7 @@
                 (CB || noop)();
                 return;
             }
-            var tableNames = Object.keys(_privateStore[dbInit.privateApi.storeMapping.resourceName].resourceManager);
+            var tableNames = Object.keys(_privateStore[dbToStorageInstance.storeMapping.resourceName].resourceManager);
 
             resolveTableData();
 
@@ -105,7 +121,7 @@
                         }
                         startChunkQuery();
                     } else {
-                        _dbApi.select('select * from ' + current)
+                        _sqlFacade.select('select * from ' + current)
                             .then(success, error);
                     }
 
@@ -123,19 +139,26 @@
                         i;
                     for (i = 0; i < len; i++) {
                         var data = ({
-                            _ref: results.rows.item(i)._ref,
-                            _data: {}
-                        });
-                        Object.keys(_publicMethods.getItem(current).columns[0])
-                            .forEach(function(column) {
-                                var value = results.rows.item(i)[column];
-                                try {
-                                    data._data[column] = JSON.parse(value);
-                                } catch (e) {
-                                    data._data[column] = value;
+                                _ref: results.rows.item(i)._ref,
+                                _data: {}
+                            }),
+                            columns = _storageFacade.getItem(current).columns[0],
+                            jsonParserTypes = ['object', 'array', 'boolean'];
+                        Object.keys(columns)
+                            .forEach(function(key) {
+                                var value = results.rows.item(i)[key];
+                                // is OBJECT or ARRAY
+                                if (value &&
+                                    typeof value === "string" &&
+                                    (
+                                        jsonParserTypes.indexOf(columns[key].type.toLowerCase()) > -1
+                                    )
+                                ) {
+                                    value = JSON.parse(value);
                                 }
-                            });
 
+                                data._data[key] = value;
+                            });
                         _privateStore[current + ":data"].push(data);
                     }
 
@@ -144,7 +167,7 @@
 
                 function startChunkQuery() {
                     var query = chunkQueries.shift()
-                    _dbApi.select('select * from ' + current + ' limit ?,?', query)
+                    _sqlFacade.select('select * from ' + current + ' limit ?,?', query)
                         .then(success, function(err) {
                             chunkQueries.push(query);
                             error(err);
@@ -172,31 +195,45 @@
             }
         }
 
-        var _publicMethods = new publicApis();
+        /**
+         * 
+         * @param {*} tbl 
+         * @param {*} definition 
+         */
+        function createTable(tbl, definition) {
+            var columns = ['_ref unique'];
+            if (definition.columns[0]) {
+                columns = columns.concat(Object.keys(definition.columns[0]));
+            }
+            _sqlFacade.createTable(tbl, columns);
+            _storageFacade.setItem(tbl, definition);
+            _privateStore[tbl + ":data"] = [];
+        }
 
-        dbInit.privateApi.storageEventHandler
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'insert'), function(tbl, data, insertData) {
+        dbToStorageInstance
+            .storageEventHandler
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'insert'), function(tbl, data, insertData) {
                 _privateStore[tbl].lastInsertId += data.length;
                 if (insertData) {
                     _privateStore[tbl + ":data"].push.apply(_privateStore[tbl + ":data"], data);
                 }
 
-                _dbApi.insert(tbl, data);
+                _sqlFacade.insert(tbl, data);
             })
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'update'), function(tbl, data) {
-                _dbApi.update(tbl, data)
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'update'), function(tbl, data) {
+                _sqlFacade.update(tbl, data)
                     .then(function() {}, txError);
             })
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'delete'), function(tbl, delItem) {
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'delete'), function(tbl, delItem) {
                 /**
                  * remove the data from memory
                  */
-                _dbApi.delete(tbl, delItem, " WHERE _ref=?", '_ref')
+                _sqlFacade.delete(tbl, delItem, " WHERE _ref=?", '_ref')
                     .then(function() {}, txError);
             })
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onAlterTable'), function(tableName, columnName, action) {
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'onAlterTable'), function(tableName, columnName, action) {
                 var columnData = "";
-                _dbApi.alterTable.apply(_dbApi, arguments)
+                _sqlFacade.alterTable.apply(_sqlFacade, arguments)
                     .then(function() {
                         if (action) {
                             var tblData = _privateStore[tableName + ":data"];
@@ -211,7 +248,7 @@
                  * update a table when these actions are performed DROP | RENAME | ADD
                  */
                 function updateTable() {
-                    _dbApi.query('update ' + tableName + ' set ' + columnName + '=?', [columnData])
+                    _sqlFacade.query('update ' + tableName + ' set ' + columnName + '=?', [columnData])
                 }
 
                 /**
@@ -222,7 +259,7 @@
                     // failure should be either for DROP and RENAME
                     if (typeof columnName === 'object') {
                         // rename mode
-                        _dbApi.alterTable(tableName, columnName[1], 1);
+                        _sqlFacade.alterTable(tableName, columnName[1], 1);
                     } else {
                         // drop
                         if (!action) {
@@ -231,30 +268,30 @@
                     }
                 }
             })
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onCreateTable'), createTable)
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onDropTable'), function(tbl) {
-                _dbApi.dropTable(tbl)
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'onCreateTable'), createTable)
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'onDropTable'), function(tbl) {
+                _sqlFacade.dropTable(tbl)
                     .then(function() {
-                        _publicMethods.removeItem(tbl);
-                        _publicMethods.removeItem(tbl + ":data");
+                        _storageFacade.removeItem(tbl);
+                        _storageFacade.removeItem(tbl + ":data");
                     });
             })
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onUpdateTable'), function(tbl, updates) {
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'onUpdateTable'), function(tbl, updates) {
                 Object.keys(updates)
                     .forEach(function(key) {
                         _privateStore[tbl][key] = updates[key];
                     });
                 // set the property to db
-                _publicMethods.setItem(tbl, _privateStore[tbl]);
+                _storageFacade.setItem(tbl, _privateStore[tbl]);
             })
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onTruncateTable'), _dbApi.delete)
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onResolveSchema'), function(version, tables) {
-                _publicMethods.setItem('version', version);
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'onTruncateTable'), _sqlFacade.delete)
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'onResolveSchema'), function(version, tables) {
+                _storageFacade.setItem('version', version);
                 Object.keys(tables).forEach(function(tblName) {
                     createTable(tblName, tables[tblName]);
                 });
             })
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onRenameTable'), function(oldTable, newTable) {
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'onRenameTable'), function(oldTable, newTable) {
                 // rename cache first
                 _privateStore[newTable] = _privateStore[oldTable];
                 _privateStore[newTable].TBL_NAME = newTable;
@@ -262,10 +299,10 @@
                 delete _privateStore[oldTable + ":data"];
                 delete _privateStore[oldTable];
 
-                _dbApi.query('update _JELI_STORE_ set _rev=? where _rev=?', [newTable, oldTable]);
-                _dbApi.query('ALTER TABLE ' + oldTable + ' RENAME TO ' + newTable, []);
+                _sqlFacade.query('update _JELI_STORE_ set _rev=? where _rev=?', [newTable, oldTable]);
+                _sqlFacade.query('ALTER TABLE ' + oldTable + ' RENAME TO ' + newTable, []);
             })
-            .subscribe(dbInit.privateApi.eventNamingIndex(dbName, 'onRenameDataBase'), function(oldName, newName, cb) {
+            .subscribe(dbToStorageInstance.eventNamingIndex(dbName, 'onRenameDataBase'), function(oldName, newName, cb) {
                 var newData = deepClone(_privateStore[oldName], true),
                     tablesData = {},
                     tbls = ['_JELI_STORE_'],
@@ -283,8 +320,8 @@
                     tbls.push(tblName);
                 });
                 var bkInstance = useDB(createDB(newName, extend(config, { name: newName })));
-                dbInit.privateApi.$getActiveDB(oldName).$get('recordResolvers').rename(newName);
-                _dbApi.dropTables(tbls);
+                dbToStorageInstance.getInstance(oldName).$get('recordResolvers').rename(newName);
+                _sqlFacade.dropTables(tbls);
                 /**
                  * create our store
                  */
@@ -297,11 +334,11 @@
                                 _rev: newName,
                                 _data: newData
                             }, {
-                                _rev: dbInit.privateApi.storeMapping.resourceName,
-                                _data: _self.getItem(dbInit.privateApi.storeMapping.resourceName)
+                                _rev: dbToStorageInstance.storeMapping.resourceName,
+                                _data: _self.getItem(dbToStorageInstance.storeMapping.resourceName)
                             }, {
-                                _rev: dbInit.privateApi.storeMapping.pendingSync,
-                                _data: _self.getItem(dbInit.privateApi.storeMapping.pendingSync)
+                                _rev: dbToStorageInstance.storeMapping.pendingSync,
+                                _data: _self.getItem(dbToStorageInstance.storeMapping.pendingSync)
                             }])
                             .then(function() {
                                 tblInstance.each(createAndInsert);
@@ -320,25 +357,20 @@
             });
 
         // create our store table
-        _dbApi.query('CREATE TABLE IF NOT EXISTS _JELI_STORE_ (_rev unique, _data)', [])
+        _sqlFacade
+            .query('CREATE TABLE IF NOT EXISTS _JELI_STORE_ (_rev unique, _data)', [])
             .then(loadAllData, function() {
-                throw new Error(type + " catched to initialize our store");
+                throw new Error(type + " failed to initialize our store");
             });
 
-        function createTable(tbl, definition) {
-            var columns = ['_ref unique'];
-            if (definition.columns[0]) {
-                columns = columns.concat(Object.keys(definition.columns[0]));
-            }
-            _dbApi.createTable(tbl, columns);
-            _publicMethods.setItem(tbl, definition);
-            _privateStore[tbl + ":data"] = [];
-        }
-
-        return _publicMethods;
+        return _storageFacade;
     }
 
-    function publicApis() {
+    /**
+     * 
+     * @param {*} generateStruct 
+     */
+    function StorageFacade(generateStruct) {
         /**
          * 
          * @param {*} name 
@@ -353,7 +385,7 @@
          */
         this.getItem = function(name) {
             if (!name) {
-                return dbInit.privateApi.generateStruct(_privateStore);
+                return generateStruct(_privateStore);
             }
 
             return _privateStore[name];
@@ -366,13 +398,13 @@
          */
         this.setItem = function(name, item) {
             _privateStore[name] = item;
-            _dbApi.query('INSERT OR REPLACE INTO _JELI_STORE_ (_rev, _data) VALUES (?,?)', [name, JSON.stringify(item)])
+            _sqlFacade.query('INSERT OR REPLACE INTO _JELI_STORE_ (_rev, _data) VALUES (?,?)', [name, JSON.stringify(item)])
                 .then(function() {});
         };
     };
 
-    publicApis.prototype.removeItem = function(name) {
-        _dbApi.query('DELETE FROM _JELI_STORE_ WHERE _rev=?', [name])
+    StorageFacade.prototype.removeItem = function(name) {
+        _sqlFacade.query('DELETE FROM _JELI_STORE_ WHERE _rev=?', [name])
             .then(function() {
                 delete _privateStore[name];
             });
@@ -380,35 +412,33 @@
         return true;
     };
 
-
-
-    publicApis.prototype.clear = function() {
-        _dbApi.query('DELETE FROM _JELI_STORE_', [])
+    StorageFacade.prototype.clear = function() {
+        _sqlFacade.query('DELETE FROM _JELI_STORE_', [])
             .then(function() {
                 _privateStore = {};
             });
     };
 
-    publicApis.prototype.isExists = function(key) {
+    StorageFacade.prototype.isExists = function(key) {
         return _privateStore.hasOwnProperty(key);
     };
-
-    function isArray(data) {
-        return toString.call(data) === "[object Array]";
-    }
 
     /**
      * 
      * @param {*} sqlInstance 
      */
-    function useDB(sqlInstance) {
+    function CoreSqlFacade(sqlInstance) {
 
         if (!sqlInstance) {
             throw new TypeError('No Plugin Support for ' + type);
         }
 
-        var _pub = {};
-
+        /**
+         * 
+         * @param {*} data 
+         * @param {*} setCol 
+         * @param {*} addRef 
+         */
         function _setData(data, setCol, addRef) {
             var col = [],
                 val = [],
@@ -439,12 +469,12 @@
 
         /**
          * 
-         * @param {*} $promise 
+         * @param {*} total 
          */
-        function promiseHandler() {
+        function promiseHandler(total) {
             var succ = 0,
                 err = 0,
-                total = 0,
+                total = total || 0,
                 sucCB = function() {},
                 errCB = function() {};
             this.success = function() {
@@ -474,28 +504,35 @@
                 total = val;
             };
 
+            /**
+             * @param succ
+             * @param err
+             */
             this.then = function(succ, err) {
                 sucCB = succ || sucCB;
                 errCB = err || errCB;
+                /**
+                 * trigger finalize
+                 */
+                finalize();
             };
         }
 
 
-        _pub.createTable = function(tableName, columns) {
-            var qPromise = new promiseHandler();
+        this.createTable = function(tableName, columns) {
+            var qPromise = new promiseHandler(1);
             sqlInstance.transaction(function(transaction) {
-                qPromise.setTotal(1);
                 transaction.executeSql('CREATE TABLE IF NOT EXISTS ' + tableName + ' (' + columns.join(',') + ')', [], qPromise.success, qPromise.error);
             });
 
             return qPromise;
         };
 
-        _pub.insert = function(table, data) {
+        this.insert = function(table, data) {
             if (!table || !isArray(data)) {
                 errorBuilder('ERROR[SQL] : Table and data is required');
             }
-            var qPromise = new promiseHandler();
+            var qPromise = new promiseHandler(data.length);
 
             function run(item, tx) {
                 var _cData = _setData(item, false, true),
@@ -506,36 +543,38 @@
 
 
             sqlInstance.transaction(function(transaction) {
-                qPromise.setTotal(data.length);
                 data.forEach(function(item) {
-                    run(item, transaction)
+                    run(item, transaction);
                 });
             });
 
             return qPromise;
         };
 
-        _pub.select = function(executeQuery, data) {
+        this.select = function(executeQuery, data) {
             if (!executeQuery) {
                 throw new Error('ERROR[SQL] : Table is required');
             }
 
-            var qPromise = new promiseHandler();
+            var qPromise = new promiseHandler(1);
             sqlInstance.transaction(function(transaction) {
-                qPromise.setTotal(1);
                 transaction.executeSql(executeQuery, data || [], qPromise.success, qPromise.error);
             });
 
             return qPromise;
         };
 
-        _pub.delete = function(table, data, where, ex) {
+        this.delete = function(table, data, where, ex) {
             if (!table) {
                 throw new Error('ERROR[SQL] : Table and data is required');
             }
 
-            var qPromise = new promiseHandler();
-
+            var qPromise = new promiseHandler(data ? data.length : 1);
+            /**
+             * 
+             * @param {*} item 
+             * @param {*} tx 
+             */
             function run(item, tx) {
                 executeQuery = "DELETE FROM " + table;
                 if (where) {
@@ -546,12 +585,10 @@
                 tx.executeSql(executeQuery, ex || [], qPromise.success, qPromise.error);
             }
 
-
             sqlInstance.transaction(function(transaction) {
                 if (data) {
-                    qPromise.setTotal(data.length);
                     data.forEach(function(item) {
-                        run(item, transaction)
+                        run(item, transaction);
                     });
                 } else {
                     run({}, transaction);
@@ -561,12 +598,12 @@
             return qPromise;
         };
 
-        _pub.update = function(table, data) {
+        this.update = function(table, data) {
             if (!table || !isArray(data)) {
                 throw new Error('ERROR[SQL] : Table and data is required');
             }
 
-            var qPromise = new promiseHandler();
+            var qPromise = new promiseHandler(data.length);
 
             function run(item, tx) {
                 var _cData = _setData(item._data, true);
@@ -576,33 +613,31 @@
             }
 
             sqlInstance.transaction(function(transaction) {
-                qPromise.setTotal(data.length);
                 data.forEach(function(item) {
-                    run(item, transaction)
+                    run(item, transaction);
                 });
             });
 
             return qPromise;
         };
 
-        _pub.dropTable = function(table) {
+        this.dropTable = function(table) {
             if (!table) {
                 throw new Error('ERROR[SQL] : Table is required');
             }
 
-            var qPromise = new promiseHandler(),
+            var qPromise = new promiseHandler(1),
                 executeQuery = "DROP TABLE IF EXISTS " + table;
 
             sqlInstance.transaction(function(transaction) {
-                qPromise.setTotal(1);
                 transaction.executeSql(executeQuery, [], qPromise.success, qPromise.error);
             });
 
             return qPromise;
         };
 
-        _pub.alterTable = function(tbl, columnName, addRemoved) {
-            var qPromise = new promiseHandler(),
+        this.alterTable = function(tbl, columnName, addRemoved) {
+            var qPromise = new promiseHandler(1),
                 executeQuery = "ALTER TABLE " + tbl;
 
             if (typeof columnName === "object") {
@@ -613,19 +648,18 @@
             }
 
             sqlInstance.transaction(function(transaction) {
-                qPromise.setTotal(1);
                 transaction.executeSql(executeQuery, [], qPromise.success, qPromise.error);
             });
 
             return qPromise;
         }
 
-        _pub.dropTables = function(tables) {
+        this.dropTables = function(tables) {
             if (!isArray(tables)) {
                 throw new Error('ERROR[SQL] : expected ArrayList<tbl>');
             }
 
-            var qPromise = new promiseHandler();
+            var qPromise = new promiseHandler(tables.length);
 
             function run(tbl, tx) {
                 executeQuery = "DROP TABLE  IF EXISTS " + tbl;
@@ -633,7 +667,6 @@
             }
 
             sqlInstance.transaction(function(transaction) {
-                qPromise.setTotal(tables.length);
                 tables.forEach(function(tbl) {
                     run(tbl, transaction);
                 });
@@ -642,17 +675,14 @@
             return qPromise;
         };
 
-        _pub.query = function(query, data) {
-            var qPromise = new promiseHandler();
+        this.query = function(query, data) {
+            var qPromise = new promiseHandler(1);
             sqlInstance.transaction(function(tx) {
-                qPromise.setTotal(1);
                 tx.executeSql(query, data, qPromise.success, qPromise.error);
             });
 
             return qPromise;
         };
-
-        return _pub;
     };
 
 
